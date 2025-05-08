@@ -82,19 +82,13 @@ fn process_directory(source: &str, destination: &str, use_modified: bool, use_ca
     for entry in WalkDir::new(source_path).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let file_path = entry.path();
-            if let Some(ext) = file_path.extension().and_then(OsStr::to_str) {
-                let mime = mime_guess::from_ext(ext).first();
-                if let Some(mime) = mime {
-                    if mime.type_() == mime::IMAGE || mime.type_() == mime::VIDEO {
-                        match process_file(file_path, destination, use_modified, use_camera_model, camera_model_is_prefix, manual_camera_model, copy_files, keep_names) {
-                            Ok(_) => {},
-                            Err(e) => warn!("Failed to process file {}: {}", file_path.display(), e),
-                        }
-                    }
-                }
+            match process_file(file_path, destination, use_modified, use_camera_model, camera_model_is_prefix, manual_camera_model, copy_files, keep_names) {
+                Ok(_) => {},
+                Err(e) => warn!("Failed to process file {}: {}", file_path.display(), e),
             }
         }
     }
+    delete_empty_folders(source)?;
     info!("Directory processing complete");
     Ok(())
 }
@@ -110,7 +104,7 @@ fn monitor_directory(source: &str, destination: &str, use_modified: bool, use_ca
     info!("Watching for changes...");
     loop {
         match rx.recv() {
-            Ok(Ok(event)) => handle_event(event, source, destination, use_modified, use_camera_model, camera_model_is_prefix, manual_camera_model, copy_files, keep_names)?,
+            Ok(Ok(event)) => handle_fs_event(event, source, destination, use_modified, use_camera_model, camera_model_is_prefix, manual_camera_model, copy_files, keep_names)?,
             Ok(Err(e)) => error!("Watch error: {:?}", e),
             Err(e) => {
                 error!("Watch channel error: {:?}", e);
@@ -121,53 +115,86 @@ fn monitor_directory(source: &str, destination: &str, use_modified: bool, use_ca
     Ok(())
 }
 
-fn handle_event(event: Event, _source: &str, destination: &str, use_modified: bool, use_camera_model: bool, camera_model_is_prefix: bool, manual_camera_model: Option<&String>, copy_files: bool, keep_names: bool) -> Result<()> {
+fn handle_fs_event(event: Event, source: &str, destination: &str, use_modified: bool, use_camera_model: bool, camera_model_is_prefix: bool, manual_camera_model: Option<&String>, copy_files: bool, keep_names: bool) -> Result<()> {
     if let notify::EventKind::Create(_) | notify::EventKind::Modify(_) = event.kind {
         for path in event.paths {
             if path.is_file() {
-                if let Some(ext) = path.extension().and_then(OsStr::to_str) {
-                    let mime = mime_guess::from_ext(ext).first();
-                    if let Some(mime) = mime {
-                        if mime.type_() == mime::IMAGE || mime.type_() == mime::VIDEO {
-                            match process_file(&path, destination, use_modified, use_camera_model, camera_model_is_prefix, manual_camera_model, copy_files, keep_names) {
-                                Ok(_) => {},
-                                Err(e) => warn!("Failed to process file {}: {}", path.display(), e),
-                            }
-                        }
-                    }
+                match process_file(&path, destination, use_modified, use_camera_model, camera_model_is_prefix, manual_camera_model, copy_files, keep_names) {
+                    Ok(_) => {},
+                    Err(e) => warn!("Failed to process file {}: {}", path.display(), e),
                 }
+            }
+        }
+    }
+    delete_empty_folders(source)?;
+    Ok(())
+}
+
+fn process_file(file_path: &Path, destination: &str, use_modified: bool, use_camera_model: bool, camera_model_is_prefix: bool, manual_camera_model: Option<&String>, copy_files: bool, keep_names: bool) -> Result<()> {
+    let mut dest_path_option: Option<PathBuf> = None;
+
+    let is_media_file = if let Some(ext) = file_path.extension().and_then(OsStr::to_str) {
+        let mime_type = mime_guess::from_ext(ext).first_or_octet_stream();
+        mime_type.type_() == mime::IMAGE || mime_type.type_() == mime::VIDEO
+    } else {
+        false
+    };
+
+    if is_media_file {
+        debug!("Processing media file: {}", file_path.display());
+        let date_time = extract_date(file_path, use_modified)
+            .context(format!("Failed to extract date from {}", file_path.display()))?;
+
+        let camera_model_str = if let Some(manual_model) = manual_camera_model {
+            manual_model.clone()
+        } else if use_camera_model {
+            extract_camera_model(file_path).unwrap_or_else(|_| "Unknown".to_string())
+        } else {
+            String::new()
+        };
+        dest_path_option = Some(create_destination_path(destination, &date_time, &camera_model_str, file_path, keep_names, camera_model_is_prefix)?);
+    } else {
+        debug!("File is not a media file (or has no/invalid extension): {}", file_path.display());
+        if !copy_files {
+            // Only move non-media files if in move mode
+            dest_path_option = Some(get_unknown_destination_path(destination, file_path));
+            debug!("Non-media file will be moved to: {}", dest_path_option.as_ref().unwrap().display());
+        } else {
+            debug!("Skipping non-media file (copy mode enabled): {}", file_path.display());
+        }
+    }
+
+    if let Some(final_dest_path) = dest_path_option {
+        if let Some(parent) = final_dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        if copy_files {
+            info!("Copying file {} to {}", file_path.display(), final_dest_path.display());
+            fs::copy(file_path, &final_dest_path)?;
+        } else {
+            info!("Moving file {} to {}", file_path.display(), final_dest_path.display());
+            fs::rename(file_path, &final_dest_path)?;
+        }
+    } else {
+        info!("Skipping file {} (no destination path determined, likely a non-media file in copy mode)", file_path.display());
+    }
+
+    Ok(())
+}
+
+fn delete_empty_folders(source: &str) -> Result<()> {
+    let source_path = Path::new(source);
+    for entry in WalkDir::new(source_path).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_dir() {
+            let folder_path = entry.path();
+            if folder_path.is_dir() && folder_path.read_dir()?.next().is_none() {
+                fs::remove_dir(folder_path)?;
             }
         }
     }
     Ok(())
 }
-
-fn process_file(file_path: &Path, destination: &str, use_modified: bool, use_camera_model: bool, camera_model_is_prefix: bool, manual_camera_model: Option<&String>, copy_files: bool, keep_names: bool) -> Result<()> {
-    let date_time = extract_date(file_path, use_modified)
-        .context(format!("Failed to extract date from {}", file_path.display()))?;
-
-    let camera_model_str = if let Some(manual_model) = manual_camera_model {
-        manual_model.clone()
-    } else if use_camera_model {
-        extract_camera_model(file_path).unwrap_or_else(|_| "Unknown".to_string())
-    } else {
-        String::new()
-    };
-
-    let dest_path = create_destination_path(destination, &date_time, &camera_model_str, file_path, keep_names, camera_model_is_prefix)?;
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if copy_files {
-        info!("Copying file {} to {}", file_path.display(), dest_path.display());
-        fs::copy(file_path, &dest_path)?;
-    } else {
-        info!("Moving file {} to {}", file_path.display(), dest_path.display());
-        fs::rename(file_path, &dest_path)?;
-    }
-    Ok(())
-}
-
 fn extract_date(file_path: &Path, use_modified: bool) -> Result<DateTime<Utc>> {
     match extract_exif_date(file_path) {
         Ok(datetime) => {
@@ -265,6 +292,40 @@ fn extract_camera_model(file_path: &Path) -> Result<String> {
     anyhow::bail!("No camera model found in EXIF data")
 }
 
+fn ensure_unique_filepath(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        debug!("Path {} is unique", path.display());
+        return path;
+    }
+
+    let parent_dir = path.parent().unwrap_or_else(|| Path::new(""));
+    
+    let filename = path.file_stem()
+        .unwrap_or_else(|| OsStr::new("")) 
+        .to_str()
+        .unwrap_or("");
+
+    let extension = path.extension()
+        .unwrap_or_else(|| OsStr::new(""))
+        .to_str()
+        .unwrap_or("");
+
+    let mut counter = 1;
+    loop {
+        let new_filename = if extension.is_empty() {
+            format!("{}_{}", filename, counter)
+        } else {
+            format!("{}_{}.{}", filename, counter, extension)
+        };
+        let candidate_path = parent_dir.join(new_filename);
+        if !candidate_path.exists() {
+            debug!("Saving file to {} as file with same name already exists.", candidate_path.display());
+            return candidate_path;
+        }
+        counter += 1;
+    }
+}
+
 fn create_destination_path(
     destination: &str,
     date_time: &DateTime<Utc>,
@@ -293,16 +354,30 @@ fn create_destination_path(
     
     let dest_subfolder_path = base_path;
 
-    if keep_names {
-        let original_filename = file_path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid original filename"))?;
-        Ok(dest_subfolder_path.join(original_filename))
+    let initial_dest_path: PathBuf = if keep_names {
+        let original_filename_osstr = file_path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid original filename"))?;
+        dest_subfolder_path.join(original_filename_osstr)
     } else {
-        let extension = file_path.extension().and_then(OsStr::to_str).unwrap_or("");
-        let new_name_string = format!(
-            "{}.{}",
-            date_time.format("%Y-%m-%dT%H-%M-%S"),
-            extension
-        );
-        Ok(dest_subfolder_path.join(new_name_string))
-    }
+        let timestamp_str = date_time.format("%Y-%m-%dT%H-%M-%S").to_string();
+        let file_ext_str = file_path
+            .extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or("");
+        
+        let filename = if file_ext_str.is_empty() {
+            timestamp_str
+        } else {
+            format!("{}.{}", timestamp_str, file_ext_str)
+        };
+        dest_subfolder_path.join(&filename)
+    };
+
+    Ok(ensure_unique_filepath(initial_dest_path))
+}
+
+fn get_unknown_destination_path(destination: &str, file_path: &Path) -> PathBuf {
+    let unknown_path = Path::new(destination).join("unknown");
+    fs::create_dir_all(&unknown_path).unwrap();
+    let unknown_file_path = unknown_path.join(file_path.file_name().unwrap());
+    unknown_file_path
 }
