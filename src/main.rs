@@ -190,12 +190,34 @@ fn process_file(file_path: &Path, destination: &str, use_modified: bool, use_cam
 
 fn delete_empty_folders(source: &str) -> Result<()> {
     let source_path = Path::new(source);
-    for entry in WalkDir::new(source_path).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_dir() {
-            let folder_path = entry.path();
-            if folder_path != source_path && folder_path.is_dir() && folder_path.read_dir()?.next().is_none() {
-                info!("Deleting empty folder: {}", folder_path.display());
-                fs::remove_dir(folder_path)?;
+
+    for entry in WalkDir::new(source_path)
+        .contents_first(true) 
+        .into_iter()
+        .filter_map(|e| e.ok()) 
+    {
+        let path = entry.path();
+
+        if path.is_dir() && path != source_path {
+            match fs::read_dir(path) {
+                Ok(mut dir_contents) => {
+                    if dir_contents.next().is_none() {
+                        match fs::remove_dir(path) {
+                            Ok(_) => {
+                                info!("Deleting empty folder: {}", path.display());
+                            }
+                            Err(e) => {
+                                warn!("Failed to delete folder {}: {}. It might already be deleted or access is denied.", path.display(), e);
+                            }
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!("Directory {} not found when checking if empty, likely already deleted by a previous step.", path.display());
+                }
+                Err(e) => {
+                    warn!("Could not read directory {} to check if empty: {}", path.display(), e);
+                }
             }
         }
     }
