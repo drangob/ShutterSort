@@ -1,0 +1,109 @@
+name: Build ShutterSort
+
+on:
+  release:
+    types: [created]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target.os }} (${{ matrix.target.arch }})
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      matrix:
+        target:
+          - os: linux
+            arch: amd64
+            rust_target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            rust_target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+          - os: macos
+            arch: amd64
+            rust_target: x86_64-apple-darwin
+            runner: macos-latest
+          - os: macos
+            arch: arm64
+            rust_target: aarch64-apple-darwin
+            runner: macos-latest
+          - os: windows
+            arch: amd64
+            rust_target: x86_64-pc-windows-msvc
+            runner: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target.rust_target }}
+
+    - name: Install cross-compilation dependencies (Linux ARM64 MUSL)
+      if: matrix.target.rust_target == 'aarch64-unknown-linux-musl'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+
+    - name: Install cross-compilation dependencies (Linux x86_64 MUSL)
+      if: matrix.target.rust_target == 'x86_64-unknown-linux-musl'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools
+
+    - name: Build
+      run: cargo build --verbose --release --target ${{ matrix.target.rust_target }}
+      env:
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+
+    - name: Determine Artifact Name and Path
+      id: artifact_details
+      shell: bash
+      run: |
+        PROJECT_NAME=$(grep '^name' Cargo.toml | sed 's/name = "\(.*\)"/\1/')
+        if [ "${{ matrix.target.os }}" == "windows" ]; then
+          ARTIFACT_NAME="${PROJECT_NAME}-${{ matrix.target.os }}-${{ matrix.target.arch }}.exe"
+          ORIGINAL_ARTIFACT_PATH="./target/${{ matrix.target.rust_target }}/release/${PROJECT_NAME}.exe"
+        else
+          ARTIFACT_NAME="${PROJECT_NAME}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+          ORIGINAL_ARTIFACT_PATH="./target/${{ matrix.target.rust_target }}/release/${PROJECT_NAME}"
+        fi
+
+        # This will be the path to the artifact, copied to the workspace root with the desired release name
+        RELEASE_ASSET_PATH="./${ARTIFACT_NAME}"
+
+        echo "Original artifact at: ${ORIGINAL_ARTIFACT_PATH}"
+        echo "Release artifact name: ${ARTIFACT_NAME}"
+        echo "Copying to: ${RELEASE_ASSET_PATH} for release upload"
+
+        cp "${ORIGINAL_ARTIFACT_PATH}" "${RELEASE_ASSET_PATH}"
+
+        echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+        echo "original_artifact_path=${ORIGINAL_ARTIFACT_PATH}" >> $GITHUB_OUTPUT
+        echo "release_asset_path=${RELEASE_ASSET_PATH}" >> $GITHUB_OUTPUT
+
+        echo "Listing original build output directory:"
+        ls -l "$(dirname "${ORIGINAL_ARTIFACT_PATH}")"
+        echo "Listing current directory (should contain the copied/renamed artifact):"
+        ls -l .
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.artifact_details.outputs.artifact_name }}
+        path: ${{ steps.artifact_details.outputs.release_asset_path }}
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: ${{ steps.artifact_details.outputs.release_asset_path }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

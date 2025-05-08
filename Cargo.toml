@@ -1,0 +1,18 @@
+[package]
+name = "ShutterSort"
+version = "1.0.0"
+authors = ["dan@horbury.dev"]
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+kamadak-exif = "0.5"
+walkdir = "2.4"
+anyhow = "1.0"
+chrono = "0.4"
+notify = "6.1"
+log = "0.4"
+env_logger = "0.10"
+mime_guess = "2.0"
+mime = "0.3"

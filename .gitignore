@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+
+
+# Rust backup files
+*.rs.bk
+
+# Windows-specific
+*.pdb
+Thumbs.db
+
+# macOS-specific
+.DS_Store
+
+# Linux-specific
+*~
+
+# IDE-specific folders
+.idea/
+.vscode/
+
+# Local environment files
+.env
+*.env
+.env.*
+
+# testing folders
+source/
+destination/
