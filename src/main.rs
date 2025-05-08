@@ -79,13 +79,18 @@ fn main() -> Result<()> {
 fn process_directory(source: &str, destination: &str, use_modified: bool, use_camera_model: bool, camera_model_is_prefix: bool, manual_camera_model: Option<&String>, copy_files: bool, keep_names: bool) -> Result<()> {
     info!("Processing directory: {}", source);
     let source_path = Path::new(source);
+    let mut files_to_process: Vec<PathBuf> = Vec::new();
+
     for entry in WalkDir::new(source_path).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
-            let file_path = entry.path();
-            match process_file(file_path, destination, use_modified, use_camera_model, camera_model_is_prefix, manual_camera_model, copy_files, keep_names) {
-                Ok(_) => {},
-                Err(e) => warn!("Failed to process file {}: {}", file_path.display(), e),
-            }
+            files_to_process.push(entry.path().to_path_buf());
+        }
+    }
+
+    for file_path in files_to_process {
+        match process_file(&file_path, destination, use_modified, use_camera_model, camera_model_is_prefix, manual_camera_model, copy_files, keep_names) {
+            Ok(_) => {},
+            Err(e) => warn!("Failed to process file {}: {}", file_path.display(), e),
         }
     }
     delete_empty_folders(source)?;
@@ -188,13 +193,15 @@ fn delete_empty_folders(source: &str) -> Result<()> {
     for entry in WalkDir::new(source_path).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_dir() {
             let folder_path = entry.path();
-            if folder_path.is_dir() && folder_path.read_dir()?.next().is_none() {
+            if folder_path != source_path && folder_path.is_dir() && folder_path.read_dir()?.next().is_none() {
+                info!("Deleting empty folder: {}", folder_path.display());
                 fs::remove_dir(folder_path)?;
             }
         }
     }
     Ok(())
 }
+
 fn extract_date(file_path: &Path, use_modified: bool) -> Result<DateTime<Utc>> {
     match extract_exif_date(file_path) {
         Ok(datetime) => {
