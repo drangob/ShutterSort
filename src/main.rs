@@ -17,11 +17,11 @@ use std::{thread, time::Duration};
 struct SharedArgs {
     #[arg(short, long, help = "Source directory containing media files")]
     source: String,
-    #[arg(short, long, help = "Destination directory for organized files")]
+    #[arg(short, long, help = "Destination directory for organised files")]
     destination: String,
     #[arg(short, long, default_value_t = false, help = "On EXIF failure, use file's last modified time (default: use creation time).")]
     use_modified: bool,
-    #[arg(long = "no-camera-model", action = clap::ArgAction::SetTrue, help = "Disable camera model extraction for folder organization. If not set, camera model will be used.")]
+    #[arg(long = "no-camera-model", action = clap::ArgAction::SetTrue, help = "Disable camera model extraction for folder organisation. If not set, camera model will be used.")]
     no_camera_model: bool,
     #[arg(long, default_value_t = false, help = "Use camera model as a prefix in the destination path (e.g., Camera/YYYY/MM/DD). Default is suffix (YYYY/MM/DD/Camera).")]
     camera_model_prefix: bool,
@@ -55,11 +55,18 @@ enum Commands {
         #[clap(flatten)]
         shared: SharedArgs,
     },
+    #[command(about = "Monitor source directory by polling and process files")]
+    Poll {
+        #[clap(flatten)]
+        shared: SharedArgs,
+        #[arg(long, help = "Polling interval in seconds", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+    },
 }
 
-const FILE_STABILITY_CHECKS: u32 = 3;
-const FILE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-const MAX_FILE_CHECK_ATTEMPTS: u32 = 360; // 30 minutes / 5 seconds = 360 attempts
+const MIMNIMUM_FILE_STABILITY_CHECKS: u32 = 3;
+const FILE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_FILE_CHECK_ATTEMPTS: u32 = 3600; // 3600 * 500ms = 30 minutes
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -77,6 +84,19 @@ fn main() -> Result<()> {
         }
         Commands::Monitor { shared } => {
             monitor_directory(&shared.source, &shared.destination, shared.use_modified, !shared.no_camera_model, shared.camera_model_prefix, shared.manual_camera_model.as_ref(), shared.copy, shared.keep_names)?;
+        }
+        Commands::Poll { shared, interval } => {
+            poll_directory(
+                &shared.source,
+                &shared.destination,
+                shared.use_modified,
+                !shared.no_camera_model,
+                shared.camera_model_prefix,
+                shared.manual_camera_model.as_ref(),
+                shared.copy,
+                shared.keep_names,
+                *interval,
+            )?;
         }
     }
     Ok(())
@@ -177,8 +197,8 @@ fn wait_for_file_stability(file_path: &Path) -> Result<()> {
 
         if current_size == previous_size {
             stable_checks_count += 1;
-            if stable_checks_count >= FILE_STABILITY_CHECKS {
-                info!("File {} stabilized with size {} after {} checks ({} attempts).", file_path.display(), current_size, stable_checks_count, attempts);
+            if stable_checks_count >= MIMNIMUM_FILE_STABILITY_CHECKS {
+                info!("File {} stabilised with size {} after {} checks ({} attempts).", file_path.display(), current_size, stable_checks_count, attempts);
                 return Ok(());
             }
         } else {
@@ -189,9 +209,9 @@ fn wait_for_file_stability(file_path: &Path) -> Result<()> {
         }
 
         if attempts >= MAX_FILE_CHECK_ATTEMPTS {
-            warn!("File {} did not stabilize after {} attempts (total {}ms). Current size: {}, previous size recorded: {}.",
-                  file_path.display(), attempts, attempts * FILE_CHECK_INTERVAL.as_millis() as u32, current_size, previous_size);
-            return Err(anyhow::anyhow!("File {} did not stabilize after maximum attempts", file_path.display()));
+            warn!("File {} did not stabilise after {} attempts (total {} seconds). Current size: {}, previous size recorded: {}.",
+                  file_path.display(), attempts, attempts * FILE_CHECK_INTERVAL.as_secs() as u32, current_size, previous_size);
+            return Err(anyhow::anyhow!("File {} did not stabilise after maximum attempts", file_path.display()));
         }
     }
 }
@@ -213,7 +233,7 @@ fn handle_fs_event(event: Event, source: &str, destination: &str, use_modified: 
                         }
                     }
                     Err(e) => {
-                        warn!("File {} did not stabilize or error during check: {}. Skipping processing.", path.display(), e);
+                        warn!("File {} did not stabilise or error during check: {}. Skipping processing.", path.display(), e);
                     }
                 }
             } else {
@@ -538,4 +558,97 @@ fn get_unknown_destination_path(destination: &str, file_path: &Path) -> PathBuf 
     fs::create_dir_all(&unknown_path).unwrap();
     let unknown_file_path = unknown_path.join(file_path.file_name().unwrap());
     unknown_file_path
+}
+
+fn poll_directory(
+    source: &str,
+    destination: &str,
+    use_modified: bool,
+    use_camera_model: bool,
+    camera_model_is_prefix: bool,
+    manual_camera_model: Option<&String>,
+    copy_files: bool,
+    keep_names: bool,
+    poll_interval_secs: u64,
+) -> Result<()> {
+    info!(
+        "Starting polling mode for directory: {}. Interval: {}s. Copy mode: {}, Keep names: {}",
+        source, poll_interval_secs, copy_files, keep_names
+    );
+    let poll_duration = Duration::from_secs(poll_interval_secs);
+    let source_path_obj = Path::new(source);
+
+    loop {
+        info!("Polling cycle started for source: {}", source);
+        let mut files_found_in_cycle = 0;
+        let mut files_processed_successfully_in_cycle = 0;
+        let mut stability_checks_passed = 0;
+        let mut stability_checks_failed = 0;
+
+        for entry_result in WalkDir::new(source_path_obj).into_iter() {
+            match entry_result {
+                Ok(entry) => {
+                    if entry.file_type().is_file() {
+                        let file_path = entry.path();
+                        files_found_in_cycle += 1;
+                        debug!("Polling: Found file candidate: {}", file_path.display());
+
+                        info!("Polling: Checking stability for file: {}", file_path.display());
+                        match wait_for_file_stability(file_path) {
+                            Ok(_) => {
+                                stability_checks_passed += 1;
+                                info!("Polling: File {} appears stable. Proceeding with processing.", file_path.display());
+
+                                match process_file(
+                                    file_path,
+                                    destination,
+                                    use_modified,
+                                    use_camera_model,
+                                    camera_model_is_prefix,
+                                    manual_camera_model,
+                                    copy_files,
+                                    keep_names,
+                                ) {
+                                    Ok(_) => {
+                                        info!("Polling: Successfully processed file {}", file_path.display());
+                                        files_processed_successfully_in_cycle += 1;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Polling: Failed to process stable file {}: {}",
+                                            file_path.display(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                stability_checks_failed += 1;
+                                warn!(
+                                    "Polling: File {} stability check failed or file issue: {}. Skipping for this cycle.",
+                                    file_path.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Polling: Error walking directory entry in {}: {}", source, e);
+                }
+            }
+        }
+
+        debug!(
+            "Polling cycle summary for {}: Found: {}, Stability Passed: {}, Stability Failed: {}, Processed OK: {}",
+            source, files_found_in_cycle, stability_checks_passed, stability_checks_failed, files_processed_successfully_in_cycle
+        );
+
+        if let Err(e) = delete_empty_folders(source) {
+            warn!("Polling: Error during periodic deletion of empty folders in {}: {}", source, e);
+        }
+
+        info!("Polling cycle complete for {}. Sleeping for {} seconds.", source, poll_interval_secs);
+        thread::sleep(poll_duration);
+    }
 }
