@@ -4,7 +4,7 @@
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/drangob/ShutterSort)](https://github.com/drangob/ShutterSort/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-ShutterSort is a command-line utility written in Rust to automatically organize your photo and video files into a structured directory hierarchy based on their metadata (EXIF data) or file system timestamps.
+ShutterSort is a command-line utility written in Rust to automatically organize your photo and video files into a structured directory hierarchy based on their metadata or file system timestamps.
 
 ## Features
 

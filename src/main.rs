@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use walkdir::WalkDir;
 use mime;
+use mediameta::{extract_file_metadata};
 
 #[derive(clap::Args, Debug)]
 struct SharedArgs {
@@ -235,6 +236,16 @@ fn extract_date(file_path: &Path, use_modified: bool) -> Result<DateTime<Utc>> {
         }
     }
 
+    match extract_video_date(file_path) {
+        Ok(datetime) => {
+            debug!("Successfully extracted video date for {}: {:?}", file_path.display(), datetime);
+            return Ok(datetime);
+        }
+        Err(e) => {
+            debug!("Failed to extract video date for {}: {}. Falling back to file metadata.", file_path.display(), e);
+        }
+    }
+
     debug!("Attempting to use file metadata for {}", file_path.display());
     let metadata = fs::metadata(file_path)
         .with_context(|| format!("Failed to read metadata for {}", file_path.display()))?;
@@ -291,6 +302,37 @@ fn extract_exif_date(file_path: &Path) -> Result<DateTime<Utc>> {
     anyhow::bail!("EXIF: No date found in EXIF data for {}", file_path.display())
 }
 
+fn extract_video_date(file_path: &Path) -> Result<DateTime<Utc>> {
+    debug!("Attempting to extract QuickTime video date using mediameta for {}", file_path.display());
+
+    let ext = file_path.extension().and_then(OsStr::to_str).unwrap_or("").to_lowercase();
+    if !matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "qt") {
+        anyhow::bail!("Not a supported video file type for date extraction with mediameta: {}", file_path.display());
+    }
+
+    let result = std::panic::catch_unwind(|| {
+        extract_file_metadata(file_path)
+    });
+
+    match result {
+        Ok(Ok(metadata)) => {
+            if let Some(creation_date_systemtime) = metadata.creation_date {
+                let creation_date_utc: DateTime<Utc> = creation_date_systemtime.into();
+                debug!("mediameta successfully extracted creation_date for {}: {:?}", file_path.display(), creation_date_utc);
+                Ok(creation_date_utc)
+            } else {
+                anyhow::bail!("mediameta: No creation date found in metadata for {}", file_path.display())
+            }
+        }
+        Ok(Err(e)) => {
+            anyhow::bail!("mediameta: Failed to extract metadata for {}: {:?}", file_path.display(), e)
+        }
+        Err(_panic_payload) => {
+            anyhow::bail!("mediameta: Panic occurred while trying to extract metadata for {}", file_path.display())
+        }
+    }
+}
+
 fn extract_camera_model(file_path: &Path) -> Result<String> {
     let file = File::open(file_path)?;
     let mut bufreader = BufReader::new(&file);
@@ -300,14 +342,12 @@ fn extract_camera_model(file_path: &Path) -> Result<String> {
         if let exif::Value::Ascii(ref vec) = field.value {
             if !vec.is_empty() {
                 if let Ok(s) = std::str::from_utf8(&vec[0]) {
-                    // Clean up model name for folder usage
                     let model = s.trim().replace(char::is_whitespace, "_");
                     return Ok(model);
                 }
             }
         }
     }
-    // Try make if model not available
     if let Some(field) = exif.get_field(exif::Tag::Make, exif::In::PRIMARY) {
         if let exif::Value::Ascii(ref vec) = field.value {
             if !vec.is_empty() {
