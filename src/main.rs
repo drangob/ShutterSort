@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use walkdir::WalkDir;
 use mime;
-use mediameta::{extract_file_metadata};
+use mediameta::extract_file_metadata;
+use std::{thread, time::Duration};
 
 #[derive(clap::Args, Debug)]
 struct SharedArgs {
@@ -55,6 +56,10 @@ enum Commands {
         shared: SharedArgs,
     },
 }
+
+const FILE_STABILITY_CHECKS: u32 = 3;
+const FILE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_FILE_CHECK_ATTEMPTS: u32 = 360; // 30 minutes / 5 seconds = 360 attempts
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -121,14 +126,98 @@ fn monitor_directory(source: &str, destination: &str, use_modified: bool, use_ca
     Ok(())
 }
 
+/// Waits for a file's size to stabilize, indicating that a write operation (like a copy) might be complete.
+fn wait_for_file_stability(file_path: &Path) -> Result<()> {
+    if !file_path.exists() {
+        debug!("File {} does not exist at start of stability check.", file_path.display());
+        return Err(anyhow::anyhow!("File does not exist: {}", file_path.display()));
+    }
+
+    let mut previous_size = match fs::metadata(file_path) {
+        Ok(meta) => meta.len(),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                 debug!("File {} not found when trying to get initial metadata: {}", file_path.display(), e);
+            } else {
+                 warn!("Failed to get initial metadata for {}: {}. Assuming unstable.", file_path.display(), e);
+            }
+            return Err(anyhow::anyhow!("Failed to get initial metadata for stability check on {}", file_path.display()).context(e));
+        }
+    };
+    let mut stable_checks_count = 0;
+    let mut attempts = 0;
+
+    debug!("Waiting for stability for file: {}", file_path.display());
+
+    loop {
+        thread::sleep(FILE_CHECK_INTERVAL);
+        attempts += 1;
+
+        if !file_path.exists() {
+            debug!("File {} was removed during stability check.", file_path.display());
+            return Err(anyhow::anyhow!("File removed during stability check: {}", file_path.display()));
+        }
+
+        let current_metadata = match fs::metadata(file_path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                warn!("Failed to get metadata for {} during stability check (attempt {}): {}. Assuming unstable.", file_path.display(), attempts, e);
+                previous_size = 0; // Invalidate previous_size to ensure change if file reappears
+                stable_checks_count = 0;
+                if attempts >= MAX_FILE_CHECK_ATTEMPTS {
+                     return Err(anyhow::anyhow!("File {} failed metadata read and max attempts reached", file_path.display()).context(e));
+                }
+                continue; // Try next attempt
+            }
+        };
+        let current_size = current_metadata.len();
+
+        debug!("File {}: prev_size={}, current_size={}, stable_checks={}, attempt={}/{}",
+               file_path.display(), previous_size, current_size, stable_checks_count, attempts, MAX_FILE_CHECK_ATTEMPTS);
+
+        if current_size == previous_size {
+            stable_checks_count += 1;
+            if stable_checks_count >= FILE_STABILITY_CHECKS {
+                info!("File {} stabilized with size {} after {} checks ({} attempts).", file_path.display(), current_size, stable_checks_count, attempts);
+                return Ok(());
+            }
+        } else {
+            debug!("File {} size changed ({} -> {}). Resetting stability counter.",
+                   file_path.display(), previous_size, current_size);
+            previous_size = current_size;
+            stable_checks_count = 0; // Reset counter if size changes
+        }
+
+        if attempts >= MAX_FILE_CHECK_ATTEMPTS {
+            warn!("File {} did not stabilize after {} attempts (total {}ms). Current size: {}, previous size recorded: {}.",
+                  file_path.display(), attempts, attempts * FILE_CHECK_INTERVAL.as_millis() as u32, current_size, previous_size);
+            return Err(anyhow::anyhow!("File {} did not stabilize after maximum attempts", file_path.display()));
+        }
+    }
+}
+
 fn handle_fs_event(event: Event, source: &str, destination: &str, use_modified: bool, use_camera_model: bool, camera_model_is_prefix: bool, manual_camera_model: Option<&String>, copy_files: bool, keep_names: bool) -> Result<()> {
     if let notify::EventKind::Create(_) | notify::EventKind::Modify(_) = event.kind {
         for path in event.paths {
             if path.is_file() {
-                match process_file(&path, destination, use_modified, use_camera_model, camera_model_is_prefix, manual_camera_model, copy_files, keep_names) {
-                    Ok(_) => {},
-                    Err(e) => warn!("Failed to process file {}: {}", path.display(), e),
+                debug!("FS Event for file: {}. Checking stability.", path.display());
+
+                match wait_for_file_stability(&path) {
+                    Ok(_) => {
+                        info!("File {} appears stable. Proceeding with processing.", path.display());
+                        match process_file(&path, destination, use_modified, use_camera_model, camera_model_is_prefix, manual_camera_model, copy_files, keep_names) {
+                            Ok(_) => {
+                                info!("Successfully processed {}", path.display());
+                            },
+                            Err(e) => warn!("Failed to process stable file {}: {}", path.display(), e),
+                        }
+                    }
+                    Err(e) => {
+                        warn!("File {} did not stabilize or error during check: {}. Skipping processing.", path.display(), e);
+                    }
                 }
+            } else {
+                debug!("FS Event for non-file path: {}. Ignoring for file processing.", path.display());
             }
         }
     }
